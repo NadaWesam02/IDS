@@ -1,732 +1,647 @@
-# app.py - Intrusion Detection System Web App + CNN Image Processing
 import streamlit as st
-import joblib
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
-from io import BytesIO
+import joblib
+import io
 import warnings
 warnings.filterwarnings('ignore')
  
-# Page configuration
+# ─────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="IDS - Network Intrusion Detector",
+    page_title="Network IDS",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
  
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# CUSTOM CSS
+# ─────────────────────────────────────────────
 st.markdown("""
 <style>
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #1e1e2e;
-        border-radius: 8px;
-        padding: 8px 20px;
-        color: #cdd6f4;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #89b4fa !important;
-        color: #1e1e2e !important;
-        font-weight: bold;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #1e1e2e, #313244);
-        border: 1px solid #45475a;
-        border-radius: 12px;
-        padding: 16px;
-        margin: 8px 0;
-    }
-    .attack-badge {
-        background: linear-gradient(135deg, #f38ba8, #e64553);
-        color: white;
-        padding: 8px 16px;
-        border-radius: 8px;
-        font-weight: bold;
-        font-size: 1.1em;
-        text-align: center;
-    }
-    .normal-badge {
-        background: linear-gradient(135deg, #a6e3a1, #40a02b);
-        color: white;
-        padding: 8px 16px;
-        border-radius: 8px;
-        font-weight: bold;
-        font-size: 1.1em;
-        text-align: center;
-    }
+.attack-badge  { background:#ff4b4b; color:white; padding:8px 20px; border-radius:20px; font-size:18px; font-weight:bold; }
+.normal-badge  { background:#00c853; color:white; padding:8px 20px; border-radius:20px; font-size:18px; font-weight:bold; }
+.metric-card   { background:#1e1e2e; border-radius:12px; padding:16px; text-align:center; }
 </style>
 """, unsafe_allow_html=True)
  
-# ── Title ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# COLUMN NAMES (NSL-KDD — 41 features)
+# ─────────────────────────────────────────────
+FEATURE_COLS = [
+    'duration','protocol_type','service','flag',
+    'src_bytes','dst_bytes','land','wrong_fragment','urgent','hot',
+    'num_failed_logins','logged_in','num_compromised','root_shell',
+    'su_attempted','num_root','num_file_creations','num_shells',
+    'num_access_files','num_outbound_cmds','is_host_login','is_guest_login',
+    'count','srv_count','serror_rate','srv_serror_rate','rerror_rate',
+    'srv_rerror_rate','same_srv_rate','diff_srv_rate','srv_diff_host_rate',
+    'dst_host_count','dst_host_srv_count','dst_host_same_srv_rate',
+    'dst_host_diff_srv_rate','dst_host_same_src_port_rate',
+    'dst_host_srv_diff_host_rate','dst_host_serror_rate',
+    'dst_host_srv_serror_rate','dst_host_rerror_rate','dst_host_srv_rerror_rate'
+]
+ 
+ALL_COLS = FEATURE_COLS + ['label', 'difficulty_level']
+ 
+# ─────────────────────────────────────────────
+# LOAD MODELS
+# ─────────────────────────────────────────────
+@st.cache_resource
+def load_models():
+    try:
+        model = joblib.load('ids_model_final.pkl')
+        scaler = joblib.load('scaler.pkl')
+        encoders = joblib.load('label_encoders.pkl')
+        return model, scaler, encoders, True
+    except Exception as e:
+        return None, None, None, False
+ 
+model, scaler, label_encoders, models_loaded = load_models()
+ 
+# ─────────────────────────────────────────────
+# HELPER: traffic row  →  6×7 pixel image
+# ─────────────────────────────────────────────
+def traffic_to_image(features_scaled: np.ndarray) -> np.ndarray:
+    """Scale a 41-feature vector to [0,1] and reshape to 6×7."""
+    vec = np.array(features_scaled, dtype=float).flatten()
+    if vec.size < 42:
+        vec = np.pad(vec, (0, 42 - vec.size))
+    vec = vec[:42]
+    mn, mx = vec.min(), vec.max()
+    if mx - mn > 0:
+        vec = (vec - mn) / (mx - mn)
+    return vec.reshape(6, 7)
+ 
+ 
+def fig_to_pil(fig):
+    """Convert matplotlib figure → PNG bytes (safe for st.image)."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+ 
+ 
+# ─────────────────────────────────────────────
+# LOAD / GENERATE NSL-KDD DATA
+# ─────────────────────────────────────────────
+@st.cache_data
+def load_nslkdd(n_samples: int = 500):
+    try:
+        url = "https://raw.githubusercontent.com/defcom17/NSL_KDD/master/KDDTrain%2B.csv"
+        df = pd.read_csv(url, header=None)
+        df.columns = ALL_COLS
+        df['binary_label'] = df['label'].apply(lambda x: 0 if x == 'normal' else 1)
+ 
+        n_each = n_samples // 2
+        normal = df[df['binary_label'] == 0].sample(min(n_each, len(df[df['binary_label']==0])), random_state=42)
+        attack = df[df['binary_label'] == 1].sample(min(n_each, len(df[df['binary_label']==1])), random_state=42)
+        data = pd.concat([normal, attack]).reset_index(drop=True)
+        return data, True
+    except Exception as e:
+        return _generate_synthetic(n_samples), False
+ 
+ 
+def _generate_synthetic(n: int):
+    rng = np.random.default_rng(42)
+    rows = []
+    for _ in range(n):
+        label = rng.integers(0, 2)
+        row = {c: rng.uniform(0, 100) for c in FEATURE_COLS
+               if c not in ('protocol_type','service','flag')}
+        row['protocol_type'] = rng.choice(['tcp','udp','icmp'])
+        row['service']       = rng.choice(['http','ftp','smtp','ssh','other'])
+        row['flag']          = rng.choice(['SF','S0','REJ','RSTO'])
+        row['label']         = 'normal' if label == 0 else 'neptune'
+        row['binary_label']  = label
+        row['difficulty_level'] = 21
+        rows.append(row)
+    return pd.DataFrame(rows)
+ 
+ 
+def preprocess_data(df: pd.DataFrame):
+    """Encode categoricals and scale using saved scaler."""
+    X = df[FEATURE_COLS].copy()
+    cat_cols = ['protocol_type', 'service', 'flag']
+    if label_encoders:
+        for col in cat_cols:
+            if col in label_encoders:
+                le = label_encoders[col]
+                X[col] = X[col].apply(
+                    lambda v: le.transform([v])[0]
+                              if v in le.classes_
+                              else le.transform([le.classes_[0]])[0]
+                )
+            else:
+                X[col] = 0
+    else:
+        for col in cat_cols:
+            X[col] = pd.factorize(X[col])[0]
+    if scaler:
+        X_scaled = scaler.transform(X)
+    else:
+        X_scaled = X.values
+    return X_scaled
+ 
+ 
+# ─────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.title("🛡️ IDS Dashboard")
+    st.markdown("---")
+    if models_loaded:
+        st.success("✅ Models loaded")
+    else:
+        st.warning("⚠️ Model files not found.\nUsing demo mode.")
+    st.markdown("**Two Detection Engines:**")
+    st.markdown("- 🌲 Random Forest (ML)")
+    st.markdown("- 🧠 CNN (Image-based)")
+    st.markdown("---")
+    st.markdown("**Dataset:** NSL-KDD  \n**Features:** 41 network features")
+ 
+# ─────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────
 st.title("🛡️ Network Intrusion Detection System")
 st.markdown("### Machine Learning + CNN Image Processing based IDS")
 st.markdown("---")
  
-# ── Load Models ───────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_models():
-    model = joblib.load('ids_model_final.pkl')
-    scaler = joblib.load('scaler.pkl')
-    encoders = joblib.load('label_encoders.pkl')
-    return model, scaler, encoders
- 
-try:
-    model, scaler, encoders = load_models()
+if models_loaded:
     st.success("✅ Models loaded successfully!")
-except Exception as e:
-    st.error(f"❌ Error loading models: {e}")
-    st.info("Please make sure all model files (ids_model_final.pkl, scaler.pkl, label_encoders.pkl) are in the same directory")
-    st.stop()
+else:
+    st.warning("⚠️ Model files not found — running in demo mode (synthetic data + random predictions).")
  
-# ── CNN Model (lazy import) ───────────────────────────────────────────────────
-@st.cache_resource
-def load_cnn_model():
-    """Try to load a saved CNN model, else return None (will train on the fly)."""
-    try:
-        import tensorflow as tf
-        cnn = tf.keras.models.load_model('cnn_ids_model.h5')
-        return cnn
-    except Exception:
-        return None
- 
-# ══════════════════════════════════════════════════════════════════════════════
-# Helper: Traffic → Image conversion
-# ══════════════════════════════════════════════════════════════════════════════
- 
-# Feature names matching NSL-KDD (41 features)
-FEATURE_NAMES = [
-    'duration', 'protocol_type', 'service', 'flag', 'src_bytes', 'dst_bytes',
-    'land', 'wrong_fragment', 'urgent', 'hot', 'num_failed_logins', 'logged_in',
-    'num_compromised', 'root_shell', 'su_attempted', 'num_root', 'num_file_creations',
-    'num_shells', 'num_access_files', 'num_outbound_cmds', 'is_host_login',
-    'is_guest_login', 'count', 'srv_count', 'serror_rate', 'srv_serror_rate',
-    'rerror_rate', 'srv_rerror_rate', 'same_srv_rate', 'diff_srv_rate',
-    'srv_diff_host_rate', 'dst_host_count', 'dst_host_srv_count',
-    'dst_host_same_srv_rate', 'dst_host_diff_srv_rate',
-    'dst_host_same_src_port_rate', 'dst_host_srv_diff_host_rate',
-    'dst_host_serror_rate', 'dst_host_srv_serror_rate', 'dst_host_rerror_rate',
-    'dst_host_srv_rerror_rate'
-]
- 
-IMG_ROWS = 6   # 6 × 7 = 42 → we use first 41
-IMG_COLS = 7
-IMG_SHAPE = (IMG_ROWS, IMG_COLS, 1)
- 
- 
-def traffic_to_image(feature_vector: np.ndarray) -> np.ndarray:
-    """
-    Convert a 1-D array of 41 network-traffic features into a
-    (IMG_ROWS × IMG_COLS) grayscale image.
- 
-    Steps:
-      1. Clip extreme outliers (99th percentile per feature in training).
-      2. Min-max normalise to [0, 1].
-      3. Pad to IMG_ROWS * IMG_COLS and reshape.
-    """
-    vec = feature_vector.copy().astype(float)
- 
-    # Normalise each value to [0, 1] using the vector's own range
-    v_min, v_max = vec.min(), vec.max()
-    if v_max - v_min > 1e-8:
-        vec = (vec - v_min) / (v_max - v_min)
-    else:
-        vec = np.zeros_like(vec)
- 
-    # Pad to fill the 2-D grid (42 cells, but only 41 features)
-    padded = np.zeros(IMG_ROWS * IMG_COLS)
-    padded[:len(vec)] = vec[:IMG_ROWS * IMG_COLS]
- 
-    img = padded.reshape(IMG_ROWS, IMG_COLS)
-    return img
- 
- 
-def batch_traffic_to_images(X: np.ndarray) -> np.ndarray:
-    """Convert a 2-D feature matrix (n_samples × 41) to image tensor."""
-    imgs = np.array([traffic_to_image(row) for row in X])
-    return imgs[..., np.newaxis]          # → (n, rows, cols, 1)
- 
- 
-def render_traffic_image(img_2d: np.ndarray,
-                         label: str = "",
-                         title: str = "Traffic Image") -> plt.Figure:
-    """Render a single traffic image with colourful feature annotations."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4),
-                             facecolor='#1e1e2e', gridspec_kw={'width_ratios': [1, 1.6]})
- 
-    # ── Left: heatmap ────────────────────────────────────────────────────────
-    ax_img = axes[0]
-    im = ax_img.imshow(img_2d, cmap='plasma', aspect='auto',
-                       vmin=0, vmax=1, interpolation='nearest')
-    ax_img.set_title(title, color='white', fontsize=11, pad=8)
-    ax_img.set_xlabel("Feature Column", color='#cdd6f4', fontsize=8)
-    ax_img.set_ylabel("Feature Row", color='#cdd6f4', fontsize=8)
-    ax_img.tick_params(colors='#6c7086')
-    for spine in ax_img.spines.values():
-        spine.set_edgecolor('#45475a')
-    plt.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04).ax.yaxis.set_tick_params(color='white')
- 
-    # ── Right: bar chart of feature intensities ───────────────────────────────
-    ax_bar = axes[1]
-    flat = img_2d.flatten()[:41]
-    colors = plt.cm.plasma(flat)
-    bars = ax_bar.bar(range(len(flat)), flat, color=colors, edgecolor='none', width=0.8)
- 
-    # Highlight top-5 most intense features
-    top5_idx = np.argsort(flat)[-5:]
-    for idx in top5_idx:
-        bars[idx].set_edgecolor('#f5c2e7')
-        bars[idx].set_linewidth(1.5)
-        ax_bar.text(idx, flat[idx] + 0.02,
-                    FEATURE_NAMES[idx].replace('_', '\n'),
-                    ha='center', va='bottom',
-                    color='#f5c2e7', fontsize=5.5, rotation=0)
- 
-    ax_bar.set_facecolor('#1e1e2e')
-    ax_bar.set_xlabel("Feature Index (0–40)", color='#cdd6f4', fontsize=8)
-    ax_bar.set_ylabel("Normalised Value", color='#cdd6f4', fontsize=8)
-    ax_bar.set_title("Feature Intensity Spectrum", color='white', fontsize=11, pad=8)
-    ax_bar.tick_params(colors='#6c7086')
-    ax_bar.set_ylim(0, 1.25)
-    for spine in ax_bar.spines.values():
-        spine.set_edgecolor('#45475a')
-    fig.patch.set_facecolor('#1e1e2e')
-    plt.tight_layout()
-    return fig
- 
- 
-# ══════════════════════════════════════════════════════════════════════════════
-# CNN Training helper (trains a tiny CNN in the browser session)
-# ══════════════════════════════════════════════════════════════════════════════
- 
-def build_and_train_cnn(X_sample: np.ndarray, y_sample: np.ndarray):
-    """
-    Build + train a compact CNN on a small labelled sample.
-    Returns (model, history_dict).
-    """
-    import tensorflow as tf
-    from tensorflow.keras import layers, models as km
- 
-    tf.random.set_seed(42)
- 
-    imgs = batch_traffic_to_images(X_sample)          # (n, 6, 7, 1)
- 
-    cnn = km.Sequential([
-        layers.Input(shape=IMG_SHAPE),
- 
-        layers.Conv2D(32, (2, 2), activation='relu', padding='same'),
-        layers.BatchNormalization(),
-        layers.MaxPooling2D((2, 2)),
- 
-        layers.Conv2D(64, (2, 2), activation='relu', padding='same'),
-        layers.BatchNormalization(),
- 
-        layers.Flatten(),
-        layers.Dense(64, activation='relu'),
-        layers.Dropout(0.3),
-        layers.Dense(1, activation='sigmoid'),
-    ], name="CNN_IDS")
- 
-    cnn.compile(optimizer='adam', loss='binary_crossentropy',
-                metrics=['accuracy'])
- 
-    history = cnn.fit(
-        imgs, y_sample,
-        epochs=15,
-        batch_size=32,
-        validation_split=0.2,
-        verbose=0
-    )
-    return cnn, history.history
- 
- 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
 # TABS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["🔍 ML Detection", "🖼️ Image Processing (CNN)", "📊 Model Info"])
  
-tab1, tab2, tab3 = st.tabs([
-    "🔍 ML Detection",
-    "🖼️ Image Processing (CNN)",
-    "📊 Model Info"
-])
  
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 1 — Original ML Detection (unchanged logic, improved layout)
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# TAB 1 — ML DETECTION
+# ══════════════════════════════════════════════
 with tab1:
-    col1, col2 = st.columns([1, 1])
+    st.header("🔍 ML-Based Intrusion Detection")
+    st.markdown("Enter network connection features below:")
  
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.subheader("📡 Network Connection Features")
-        st.markdown("Enter the network connection details below:")
- 
-        duration = st.number_input("Duration (seconds)", min_value=0, value=0, step=1)
-        protocol_type = st.selectbox("Protocol Type", ["tcp", "udp", "icmp"])
-        service = st.selectbox("Service", ["http", "private", "smtp", "ftp", "telnet", "other"])
-        flag = st.selectbox("Flag", ["SF", "S0", "REJ", "RSTO", "RSTR"])
-        src_bytes = st.number_input("Source Bytes", min_value=0, value=0, step=100)
-        dst_bytes = st.number_input("Destination Bytes", min_value=0, value=0, step=100)
- 
-        with st.expander("Advanced Features (Optional)"):
-            st.info("Leave default values if not sure")
-            land = st.number_input("Land", value=0)
-            wrong_fragment = st.number_input("Wrong Fragment", value=0)
-            urgent = st.number_input("Urgent", value=0)
- 
+        duration     = st.number_input("Duration (sec)", 0, 60000, 0)
+        src_bytes    = st.number_input("Src Bytes",       0, 10_000_000, 0)
+        dst_bytes    = st.number_input("Dst Bytes",       0, 10_000_000, 0)
     with col2:
-        st.subheader("🔍 Detection Result")
-        st.markdown("Click the button below to analyse the connection")
+        protocol_type = st.selectbox("Protocol", ['tcp','udp','icmp'])
+        service       = st.selectbox("Service",  ['http','ftp','smtp','ssh','other',
+                                                   'private','domain_u','telnet'])
+        flag          = st.selectbox("Flag",     ['SF','S0','REJ','RSTO','RSTR','SH'])
+    with col3:
+        land          = st.selectbox("Land",      [0, 1])
+        logged_in     = st.selectbox("Logged In", [0, 1])
+        count         = st.number_input("Count",  0, 512, 1)
  
-        if st.button("🚨 DETECT INTRUSION", type="primary", use_container_width=True):
-            try:
-                protocol_encoded = encoders['protocol_type'].transform([protocol_type])[0]
-                service_encoded  = encoders['service'].transform([service])[0]
-                flag_encoded     = encoders['flag'].transform([flag])[0]
+    with st.expander("⚙️ Advanced Features"):
+        col4, col5 = st.columns(2)
+        with col4:
+            wrong_fragment   = st.number_input("Wrong Fragment",   0, 3,   0)
+            urgent           = st.number_input("Urgent",           0, 3,   0)
+            hot              = st.number_input("Hot",              0, 100, 0)
+            num_failed_logins= st.number_input("Num Failed Logins",0, 5,   0)
+            num_compromised  = st.number_input("Num Compromised",  0, 100, 0)
+            root_shell       = st.selectbox("Root Shell", [0, 1])
+            su_attempted     = st.selectbox("SU Attempted", [0, 1])
+            num_root         = st.number_input("Num Root",         0, 100, 0)
+        with col5:
+            num_file_creations = st.number_input("Num File Creations", 0, 100, 0)
+            num_shells         = st.number_input("Num Shells",         0, 5,   0)
+            num_access_files   = st.number_input("Num Access Files",   0, 10,  0)
+            num_outbound_cmds  = st.number_input("Num Outbound Cmds",  0, 0,   0)
+            is_host_login      = st.selectbox("Is Host Login",  [0, 1])
+            is_guest_login     = st.selectbox("Is Guest Login", [0, 1])
  
-                features = np.array([
-                    duration, protocol_encoded, service_encoded, flag_encoded,
-                    src_bytes, dst_bytes, land, wrong_fragment, urgent,
-                    *([0] * 32)
-                ]).reshape(1, -1)
+        col6, col7 = st.columns(2)
+        with col6:
+            srv_count           = st.number_input("Srv Count",            0, 512, 1)
+            serror_rate         = st.slider("Serror Rate",                0.0, 1.0, 0.0)
+            srv_serror_rate     = st.slider("Srv Serror Rate",            0.0, 1.0, 0.0)
+            rerror_rate         = st.slider("Rerror Rate",                0.0, 1.0, 0.0)
+            srv_rerror_rate     = st.slider("Srv Rerror Rate",            0.0, 1.0, 0.0)
+            same_srv_rate       = st.slider("Same Srv Rate",              0.0, 1.0, 1.0)
+            diff_srv_rate       = st.slider("Diff Srv Rate",              0.0, 1.0, 0.0)
+            srv_diff_host_rate  = st.slider("Srv Diff Host Rate",         0.0, 1.0, 0.0)
+        with col7:
+            dst_host_count              = st.number_input("Dst Host Count",              0, 255, 255)
+            dst_host_srv_count          = st.number_input("Dst Host Srv Count",          0, 255, 255)
+            dst_host_same_srv_rate      = st.slider("Dst Host Same Srv Rate",            0.0, 1.0, 1.0)
+            dst_host_diff_srv_rate      = st.slider("Dst Host Diff Srv Rate",            0.0, 1.0, 0.0)
+            dst_host_same_src_port_rate = st.slider("Dst Host Same Src Port Rate",       0.0, 1.0, 0.0)
+            dst_host_srv_diff_host_rate = st.slider("Dst Host Srv Diff Host Rate",       0.0, 1.0, 0.0)
+            dst_host_serror_rate        = st.slider("Dst Host Serror Rate",              0.0, 1.0, 0.0)
+            dst_host_srv_serror_rate    = st.slider("Dst Host Srv Serror Rate",          0.0, 1.0, 0.0)
+            dst_host_rerror_rate        = st.slider("Dst Host Rerror Rate",              0.0, 1.0, 0.0)
+            dst_host_srv_rerror_rate    = st.slider("Dst Host Srv Rerror Rate",          0.0, 1.0, 0.0)
  
-                features_scaled = scaler.transform(features)
-                prediction      = model.predict(features_scaled)[0]
-                probability     = model.predict_proba(features_scaled)[0]
+    if st.button("🚀 Detect Intrusion", type="primary"):
+        input_dict = {
+            'duration': duration, 'protocol_type': protocol_type,
+            'service': service, 'flag': flag,
+            'src_bytes': src_bytes, 'dst_bytes': dst_bytes,
+            'land': land, 'wrong_fragment': wrong_fragment, 'urgent': urgent,
+            'hot': hot, 'num_failed_logins': num_failed_logins,
+            'logged_in': logged_in, 'num_compromised': num_compromised,
+            'root_shell': root_shell, 'su_attempted': su_attempted,
+            'num_root': num_root, 'num_file_creations': num_file_creations,
+            'num_shells': num_shells, 'num_access_files': num_access_files,
+            'num_outbound_cmds': num_outbound_cmds,
+            'is_host_login': is_host_login, 'is_guest_login': is_guest_login,
+            'count': count, 'srv_count': srv_count,
+            'serror_rate': serror_rate, 'srv_serror_rate': srv_serror_rate,
+            'rerror_rate': rerror_rate, 'srv_rerror_rate': srv_rerror_rate,
+            'same_srv_rate': same_srv_rate, 'diff_srv_rate': diff_srv_rate,
+            'srv_diff_host_rate': srv_diff_host_rate,
+            'dst_host_count': dst_host_count,
+            'dst_host_srv_count': dst_host_srv_count,
+            'dst_host_same_srv_rate': dst_host_same_srv_rate,
+            'dst_host_diff_srv_rate': dst_host_diff_srv_rate,
+            'dst_host_same_src_port_rate': dst_host_same_src_port_rate,
+            'dst_host_srv_diff_host_rate': dst_host_srv_diff_host_rate,
+            'dst_host_serror_rate': dst_host_serror_rate,
+            'dst_host_srv_serror_rate': dst_host_srv_serror_rate,
+            'dst_host_rerror_rate': dst_host_rerror_rate,
+            'dst_host_srv_rerror_rate': dst_host_srv_rerror_rate,
+        }
  
-                st.markdown("---")
-                if prediction == 1:
-                    st.markdown('<div class="attack-badge">🚨 ALERT: INTRUSION DETECTED!</div>',
-                                unsafe_allow_html=True)
-                    st.metric("Attack Confidence", f"{probability[1]*100:.2f}%")
-                    st.progress(int(probability[1] * 100))
-                else:
-                    st.markdown('<div class="normal-badge">✅ NORMAL TRAFFIC</div>',
-                                unsafe_allow_html=True)
-                    st.metric("Normal Confidence", f"{probability[0]*100:.2f}%")
-                    st.progress(int(probability[0] * 100))
+        input_df = pd.DataFrame([input_dict])
  
-                with st.expander("📊 Detailed Analysis"):
-                    st.write(f"**Prediction:** {'Attack' if prediction==1 else 'Normal'}")
-                    st.write(f"**Confidence:** {max(probability)*100:.2f}%")
-                    st.write(f"**Attack Probability:** {probability[1]*100:.2f}%")
-                    st.write(f"**Normal Probability:** {probability[0]*100:.2f}%")
+        try:
+            # Encode categoricals
+            cat_cols = ['protocol_type', 'service', 'flag']
+            if label_encoders:
+                for col in cat_cols:
+                    le = label_encoders[col]
+                    val = input_df[col].iloc[0]
+                    input_df[col] = le.transform([val])[0] if val in le.classes_ else 0
+            else:
+                for col in cat_cols:
+                    input_df[col] = 0
  
-                # ── Also show the traffic image ───────────────────────────────
-                st.markdown("---")
-                st.markdown("#### 🖼️ Traffic Visualised as Image")
-                raw_vec = features[0]
-                img_2d  = traffic_to_image(raw_vec)
-                label   = "Attack" if prediction == 1 else "Normal"
-                fig     = render_traffic_image(img_2d, label=label,
-                                               title=f"Traffic Image — {label}")
-                st.pyplot(fig)
-                plt.close(fig)
+            X_scaled = scaler.transform(input_df[FEATURE_COLS]) if scaler else input_df[FEATURE_COLS].values
+            prediction = model.predict(X_scaled)[0] if model else np.random.randint(0, 2)
  
-            except Exception as e:
-                st.error(f"Error during prediction: {e}")
-                st.info("Make sure all fields are filled correctly")
+            st.markdown("---")
+            if prediction == 1:
+                st.markdown('<span class="attack-badge">🚨 ATTACK DETECTED</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="normal-badge">✅ NORMAL TRAFFIC</span>', unsafe_allow_html=True)
  
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 2 — Image Processing (CNN)
-# ─────────────────────────────────────────────────────────────────────────────
+            # Show traffic image
+            st.subheader("📊 Traffic Visualisation")
+            img = traffic_to_image(X_scaled[0])
+ 
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            fig.patch.set_facecolor('#0e1117')
+ 
+            axes[0].imshow(img, cmap='hot', interpolation='nearest', aspect='auto')
+            axes[0].set_title("Traffic Heatmap (6×7)", color='white')
+            axes[0].set_xlabel("Feature Group", color='white')
+            axes[0].set_ylabel("Row", color='white')
+            axes[0].tick_params(colors='white')
+            for spine in axes[0].spines.values():
+                spine.set_edgecolor('white')
+ 
+            axes[1].bar(range(len(X_scaled[0])), X_scaled[0],
+                        color='#ff4b4b' if prediction == 1 else '#00c853',
+                        alpha=0.7)
+            axes[1].set_title("Feature Values (scaled)", color='white')
+            axes[1].set_xlabel("Feature Index", color='white')
+            axes[1].set_ylabel("Value", color='white')
+            axes[1].tick_params(colors='white')
+            axes[1].set_facecolor('#1e1e2e')
+            fig.tight_layout()
+ 
+            st.image(fig_to_pil(fig))
+ 
+        except Exception as e:
+            st.error(f"Prediction error: {e}")
+ 
+ 
+# ══════════════════════════════════════════════
+# TAB 2 — CNN IMAGE PROCESSING
+# ══════════════════════════════════════════════
 with tab2:
-    st.subheader("🖼️ CNN-Based Image Processing for Intrusion Detection")
+    st.header("🖼️ CNN-Based Image Processing for Intrusion Detection")
+    st.info(
+        "**Idea:** Each network connection's 41 features are laid out as a **6 × 7 pixel grayscale image**. "
+        "A Convolutional Neural Network then learns spatial patterns — just like it would for photos. "
+        "This approach captures **feature interactions** that tabular models miss."
+    )
  
-    st.markdown("""
-    > **Idea:** Each network connection's 41 features are laid out as a **6 × 7 pixel grayscale image**.
-    > A Convolutional Neural Network then learns spatial patterns — just like it would for photos.
-    > This approach captures **feature interactions** that tabular models miss.
-    """)
+    # ── Step 1: Load data ──────────────────────
+    st.subheader("Step 1 — Provide Traffic Samples")
+    n_samples = st.slider("Number of samples", 200, 2000, 500, step=100)
+ 
+    if st.button("🔄 Load / Generate Data"):
+        with st.spinner("Loading NSL-KDD data…"):
+            df_cnn, from_net = load_nslkdd(n_samples)
+            st.session_state['cnn_df'] = df_cnn
+            st.session_state['cnn_from_net'] = from_net
+        source = "NSL-KDD GitHub" if from_net else "synthetic (no internet)"
+        n_ok  = int((df_cnn['binary_label'] == 0).sum())
+        n_atk = int((df_cnn['binary_label'] == 1).sum())
+        st.success(f"✅ Loaded {len(df_cnn)} samples | Normal: {n_ok} | Attack: {n_atk}  [{source}]")
  
     st.markdown("---")
  
-    # ── Step 1: Generate or upload sample data ────────────────────────────────
-    st.markdown("### Step 1 — Provide Traffic Samples")
+    # ── Step 2: Visualise ─────────────────────
+    st.subheader("Step 2 — Visualise Traffic as Images")
  
-    data_source = st.radio(
-        "Choose data source:",
-        ["🎲 Generate synthetic samples", "📁 Load from NSL-KDD (online)"],
-        horizontal=True
-    )
+    col_b1, col_b2, col_b3 = st.columns(3)
  
-    n_samples = st.slider("Number of samples to use", 200, 2000, 500, step=100)
+    def _show_sample(label_val: int, title: str, cmap: str):
+        df_cnn = st.session_state.get('cnn_df')
+        if df_cnn is None:
+            st.warning("⚠️ Please load data first (Step 1).")
+            return
+        subset = df_cnn[df_cnn['binary_label'] == label_val]
+        if subset.empty:
+            st.warning("No samples found.")
+            return
+        row = subset.sample(1, random_state=np.random.randint(0, 9999)).iloc[0]
+        X = preprocess_data(pd.DataFrame([row]))
+        img = traffic_to_image(X[0])
  
-    if st.button("🔄 Load / Generate Data", use_container_width=True):
-        with st.spinner("Preparing data..."):
-            try:
-                if data_source == "📁 Load from NSL-KDD (online)":
-                    train_url = "https://raw.githubusercontent.com/defcom17/NSL_KDD/master/KDDTrain%2B.csv"
-                    df = pd.read_csv(train_url, nrows=n_samples + 50)
+        fig, ax = plt.subplots(figsize=(4, 3))
+        fig.patch.set_facecolor('#0e1117')
+        ax.imshow(img, cmap=cmap, interpolation='nearest', aspect='auto')
+        ax.set_title(title, color='white', fontsize=11)
+        ax.set_xlabel("Feature Group", color='white')
+        ax.set_ylabel("Row", color='white')
+        ax.tick_params(colors='white')
+        for sp in ax.spines.values():
+            sp.set_edgecolor('white')
+        fig.tight_layout()
+        st.image(fig_to_pil(fig), caption=title)
  
-                    cols = FEATURE_NAMES + ['label', 'difficulty_level']
-                    if len(df.columns) == len(cols):
-                        df.columns = cols
-                    else:
-                        df.columns = cols[:len(df.columns)]
+    with col_b1:
+        if st.button("🟢 Show Random NORMAL Sample"):
+            _show_sample(0, "Normal Traffic", 'Greens')
  
-                    df['binary_label'] = df['label'].apply(
-                        lambda x: 0 if x == 'normal' else 1)
+    with col_b2:
+        if st.button("🔴 Show Random ATTACK Sample"):
+            _show_sample(1, "Attack Traffic", 'Reds')
  
-                    cat_cols = ['protocol_type', 'service', 'flag']
-                    for col in cat_cols:
-                        if col in df.columns:
-                            try:
-                                df[col] = encoders[col].transform(df[col])
-                            except Exception:
-                                from sklearn.preprocessing import LabelEncoder
-                                le = LabelEncoder()
-                                df[col] = le.fit_transform(df[col])
- 
-                    feat_cols = [c for c in FEATURE_NAMES if c in df.columns]
-                    X_raw = df[feat_cols].values.astype(float)[:n_samples]
-                    y_raw = df['binary_label'].values[:n_samples]
- 
+    with col_b3:
+        if st.button("⚡ Compare Normal vs Attack (side by side)"):
+            df_cnn = st.session_state.get('cnn_df')
+            if df_cnn is None:
+                st.warning("⚠️ Please load data first (Step 1).")
+            else:
+                normals = df_cnn[df_cnn['binary_label'] == 0]
+                attacks = df_cnn[df_cnn['binary_label'] == 1]
+                if normals.empty or attacks.empty:
+                    st.warning("Not enough samples for comparison.")
                 else:
-                    # Synthetic: random normal + attack patterns
-                    rng = np.random.RandomState(42)
-                    half = n_samples // 2
+                    row_n = normals.sample(1, random_state=42).iloc[0]
+                    row_a = attacks.sample(1, random_state=42).iloc[0]
+                    img_n = traffic_to_image(preprocess_data(pd.DataFrame([row_n]))[0])
+                    img_a = traffic_to_image(preprocess_data(pd.DataFrame([row_a]))[0])
  
-                    X_normal = rng.normal(loc=0.1, scale=0.05, size=(half, 41)).clip(0, 1)
-                    X_attack = rng.normal(loc=0.7, scale=0.2,  size=(half, 41)).clip(0, 1)
-                    # Inject typical attack signatures
-                    X_attack[:, 4] *= 10     # high src_bytes
-                    X_attack[:, 24] = rng.uniform(0.8, 1.0, half)  # high serror_rate
+                    fig, axes = plt.subplots(1, 2, figsize=(8, 3))
+                    fig.patch.set_facecolor('#0e1117')
+                    axes[0].imshow(img_n, cmap='Greens', interpolation='nearest', aspect='auto')
+                    axes[0].set_title("Normal Traffic", color='white')
+                    axes[1].imshow(img_a, cmap='Reds',   interpolation='nearest', aspect='auto')
+                    axes[1].set_title("Attack Traffic",  color='white')
+                    for ax in axes:
+                        ax.tick_params(colors='white')
+                        for sp in ax.spines.values():
+                            sp.set_edgecolor('white')
+                    fig.tight_layout()
+                    st.image(fig_to_pil(fig), caption="Normal vs Attack — pixel patterns differ")
  
-                    X_raw = np.vstack([X_normal, X_attack])
-                    y_raw = np.array([0]*half + [1]*half)
-                    shuffle = rng.permutation(n_samples)
-                    X_raw, y_raw = X_raw[shuffle], y_raw[shuffle]
+    st.markdown("---")
  
-                st.session_state['X_raw'] = X_raw
-                st.session_state['y_raw'] = y_raw
-                st.success(f"✅ Loaded {len(X_raw)} samples  |  "
-                           f"Normal: {(y_raw==0).sum()}  |  "
-                           f"Attack: {(y_raw==1).sum()}")
+    # ── Step 3: Train CNN ──────────────────────
+    st.subheader("Step 3 — Train CNN on Traffic Images")
+    st.info("💡 The CNN learns to classify Normal vs Attack directly from the pixel images.")
  
-            except Exception as ex:
-                st.error(f"Failed to load data: {ex}")
+    col_ep, col_bs = st.columns(2)
+    with col_ep:
+        epochs     = st.slider("Epochs",     5, 30, 10)
+    with col_bs:
+        batch_size = st.slider("Batch Size", 16, 128, 32)
  
-    # ── Step 2: Visualise traffic images ─────────────────────────────────────
-    if 'X_raw' in st.session_state:
-        st.markdown("---")
-        st.markdown("### Step 2 — Visualise Traffic as Images")
- 
-        X_raw = st.session_state['X_raw']
-        y_raw = st.session_state['y_raw']
- 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("🟢 Show Random NORMAL Sample", use_container_width=True):
-                idx = np.random.choice(np.where(y_raw == 0)[0])
-                img = traffic_to_image(X_raw[idx])
-                fig = render_traffic_image(img, title=f"Sample #{idx} — NORMAL ✅")
-                st.pyplot(fig);  plt.close(fig)
- 
-        with col_b:
-            if st.button("🔴 Show Random ATTACK Sample", use_container_width=True):
-                idx = np.random.choice(np.where(y_raw == 1)[0])
-                img = traffic_to_image(X_raw[idx])
-                fig = render_traffic_image(img, title=f"Sample #{idx} — ATTACK 🚨")
-                st.pyplot(fig);  plt.close(fig)
- 
-        # Side-by-side comparison
-        if st.button("⚡ Compare Normal vs Attack (side by side)", use_container_width=True):
-            norm_idx   = np.random.choice(np.where(y_raw == 0)[0])
-            attack_idx = np.random.choice(np.where(y_raw == 1)[0])
-            img_norm   = traffic_to_image(X_raw[norm_idx])
-            img_att    = traffic_to_image(X_raw[attack_idx])
- 
-            fig, axes = plt.subplots(1, 2, figsize=(10, 3.5), facecolor='#1e1e2e')
-            for ax, img, ttl, cmap in zip(
-                    axes,
-                    [img_norm, img_att],
-                    ["NORMAL ✅", "ATTACK 🚨"],
-                    ['Greens', 'Reds']):
-                im = ax.imshow(img, cmap=cmap, aspect='auto', vmin=0, vmax=1)
-                ax.set_title(ttl, color='white', fontsize=13, pad=8)
-                ax.tick_params(colors='#6c7086')
-                for sp in ax.spines.values():
-                    sp.set_edgecolor('#45475a')
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            fig.patch.set_facecolor('#1e1e2e')
-            fig.suptitle("Traffic → Image Comparison", color='#cdd6f4',
-                         fontsize=14, y=1.02)
-            plt.tight_layout()
-            st.pyplot(fig);  plt.close(fig)
- 
-        # ── Step 3: Train CNN ─────────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("### Step 3 — Train CNN on Traffic Images")
- 
-        st.info("💡 The CNN learns to classify Normal vs Attack directly from the pixel images.")
- 
-        col_ep, col_bs = st.columns(2)
-        with col_ep:
-            epochs = st.slider("Epochs", 5, 30, 15)
-        with col_bs:
-            batch_size_opt = st.select_slider("Batch size", options=[16, 32, 64], value=32)
- 
-        if st.button("🚀 Train CNN", type="primary", use_container_width=True):
+    if st.button("🚀 Train CNN", type="primary"):
+        df_cnn = st.session_state.get('cnn_df')
+        if df_cnn is None:
+            st.error("⚠️ Please load data first (Step 1).")
+        else:
             try:
                 import tensorflow as tf
-                tf_available = True
-            except ImportError:
-                tf_available = False
-                st.error("TensorFlow is not installed. Run: `pip install tensorflow`")
+                from tensorflow.keras.models import Sequential
+                from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Flatten,
+                                                     Dense, Dropout, BatchNormalization)
  
-            if tf_available:
-                with st.spinner("Training CNN… this may take ~30 seconds ⏳"):
-                    try:
-                        from tensorflow.keras import layers, models as km
+                X_raw = preprocess_data(df_cnn)
+                y     = df_cnn['binary_label'].values
  
-                        imgs = batch_traffic_to_images(X_raw)
-                        from sklearn.model_selection import train_test_split
-                        Xi_tr, Xi_val, yi_tr, yi_val = train_test_split(
-                            imgs, y_raw, test_size=0.2, random_state=42,
-                            stratify=y_raw)
+                # Build image tensors
+                imgs = np.array([traffic_to_image(row) for row in X_raw])
+                imgs = imgs[..., np.newaxis]          # (N, 6, 7, 1)
+                y    = y.astype(np.float32)
  
-                        cnn = km.Sequential([
-                            layers.Input(shape=IMG_SHAPE),
-                            layers.Conv2D(32, (2,2), activation='relu', padding='same'),
-                            layers.BatchNormalization(),
-                            layers.MaxPooling2D((2,2)),
-                            layers.Conv2D(64, (2,2), activation='relu', padding='same'),
-                            layers.BatchNormalization(),
-                            layers.Flatten(),
-                            layers.Dense(64, activation='relu'),
-                            layers.Dropout(0.3),
-                            layers.Dense(1, activation='sigmoid'),
-                        ], name="CNN_IDS")
+                # Train / val split
+                split = int(0.8 * len(imgs))
+                X_tr, X_val = imgs[:split], imgs[split:]
+                y_tr, y_val = y[:split],    y[split:]
  
-                        cnn.compile(optimizer='adam',
-                                    loss='binary_crossentropy',
-                                    metrics=['accuracy'])
+                # Build model
+                cnn_model = Sequential([
+                    Conv2D(32, (2,2), activation='relu', padding='same', input_shape=(6,7,1)),
+                    BatchNormalization(),
+                    MaxPooling2D((2,2), padding='same'),
+                    Conv2D(64, (2,2), activation='relu', padding='same'),
+                    BatchNormalization(),
+                    Flatten(),
+                    Dense(64, activation='relu'),
+                    Dropout(0.3),
+                    Dense(1, activation='sigmoid'),
+                ])
+                cnn_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
  
-                        history = cnn.fit(
-                            Xi_tr, yi_tr,
-                            epochs=epochs,
-                            batch_size=batch_size_opt,
-                            validation_data=(Xi_val, yi_val),
-                            verbose=0
-                        )
+                # Progress bar training
+                progress = st.progress(0, text="Training CNN…")
+                history_acc, history_val_acc = [], []
+                history_loss, history_val_loss = [], []
  
-                        st.session_state['cnn_model']   = cnn
-                        st.session_state['cnn_history'] = history.history
-                        st.session_state['Xi_val']      = Xi_val
-                        st.session_state['yi_val']      = yi_val
+                for ep in range(epochs):
+                    hist = cnn_model.fit(
+                        X_tr, y_tr,
+                        validation_data=(X_val, y_val),
+                        epochs=1, batch_size=batch_size, verbose=0
+                    )
+                    history_acc.append(hist.history['accuracy'][0])
+                    history_val_acc.append(hist.history['val_accuracy'][0])
+                    history_loss.append(hist.history['loss'][0])
+                    history_val_loss.append(hist.history['val_loss'][0])
+                    progress.progress((ep+1)/epochs, text=f"Epoch {ep+1}/{epochs} — acc: {history_acc[-1]:.3f}")
  
-                        val_acc = history.history['val_accuracy'][-1]
-                        val_loss = history.history['val_loss'][-1]
-                        st.success(f"✅ CNN trained!  Val Accuracy: **{val_acc*100:.2f}%**  |  "
-                                   f"Val Loss: **{val_loss:.4f}**")
+                st.success(f"✅ Training complete! Final val accuracy: {history_val_acc[-1]:.4f}")
+                st.session_state['cnn_model']   = cnn_model
+                st.session_state['cnn_history'] = {
+                    'accuracy': history_acc, 'val_accuracy': history_val_acc,
+                    'loss': history_loss, 'val_loss': history_val_loss
+                }
  
-                    except Exception as ex:
-                        st.error(f"Training failed: {ex}")
+                # ── Step 4: Results ──────────────────────
+                st.subheader("Step 4 — Results")
+                ep_range = range(1, epochs+1)
  
-        # ── Step 4: Show results ─────────────────────────────────────────────
-        if 'cnn_history' in st.session_state:
-            st.markdown("---")
-            st.markdown("### Step 4 — CNN Training Results")
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                fig.patch.set_facecolor('#0e1117')
  
-            hist     = st.session_state['cnn_history']
-            Xi_val   = st.session_state['Xi_val']
-            yi_val   = st.session_state['yi_val']
-            cnn_mdl  = st.session_state['cnn_model']
+                axes[0].plot(ep_range, history_acc,     label='Train Acc',  color='#00c853')
+                axes[0].plot(ep_range, history_val_acc, label='Val Acc',    color='#ff4b4b', linestyle='--')
+                axes[0].set_title("Accuracy", color='white')
+                axes[0].set_xlabel("Epoch", color='white')
+                axes[0].tick_params(colors='white')
+                axes[0].set_facecolor('#1e1e2e')
+                axes[0].legend(facecolor='#1e1e2e', labelcolor='white')
  
-            # ── Training curves ───────────────────────────────────────────────
-            fig, axes = plt.subplots(1, 2, figsize=(12, 4), facecolor='#1e1e2e')
-            for ax, metric, title, colour in zip(
-                    axes,
-                    ['accuracy', 'loss'],
-                    ['Accuracy', 'Loss'],
-                    ['#89b4fa', '#f38ba8']):
-                ax.plot(hist[metric],     color=colour,        lw=2, label='Train')
-                ax.plot(hist[f'val_{metric}'], color='#a6e3a1', lw=2,
-                        linestyle='--', label='Validation')
-                ax.set_facecolor('#1e1e2e')
-                ax.set_title(title, color='white', fontsize=12)
-                ax.set_xlabel('Epoch', color='#cdd6f4')
-                ax.tick_params(colors='#6c7086')
-                for sp in ax.spines.values():
-                    sp.set_edgecolor('#45475a')
-                ax.legend(facecolor='#313244', labelcolor='white')
-            fig.patch.set_facecolor('#1e1e2e')
-            plt.tight_layout()
-            st.pyplot(fig);  plt.close(fig)
+                axes[1].plot(ep_range, history_loss,     label='Train Loss', color='#00c853')
+                axes[1].plot(ep_range, history_val_loss, label='Val Loss',   color='#ff4b4b', linestyle='--')
+                axes[1].set_title("Loss", color='white')
+                axes[1].set_xlabel("Epoch", color='white')
+                axes[1].tick_params(colors='white')
+                axes[1].set_facecolor('#1e1e2e')
+                axes[1].legend(facecolor='#1e1e2e', labelcolor='white')
  
-            # ── Confusion Matrix ──────────────────────────────────────────────
-            y_pred_prob = cnn_mdl.predict(Xi_val, verbose=0).flatten()
-            y_pred      = (y_pred_prob >= 0.5).astype(int)
+                fig.tight_layout()
+                st.image(fig_to_pil(fig))
  
-            from sklearn.metrics import confusion_matrix, classification_report, f1_score
-            cm  = confusion_matrix(yi_val, y_pred)
-            f1  = f1_score(yi_val, y_pred)
-            acc = (y_pred == yi_val).mean()
+                # Confusion matrix
+                from sklearn.metrics import confusion_matrix, classification_report
+                y_pred = (cnn_model.predict(X_val) > 0.5).astype(int).flatten()
+                cm = confusion_matrix(y_val.astype(int), y_pred)
  
-            col_cm, col_rep = st.columns([1, 1])
-            with col_cm:
-                fig2, ax2 = plt.subplots(figsize=(5, 4), facecolor='#1e1e2e')
+                fig2, ax2 = plt.subplots(figsize=(5, 4))
+                fig2.patch.set_facecolor('#0e1117')
                 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                            xticklabels=['Normal', 'Attack'],
-                            yticklabels=['Normal', 'Attack'],
-                            ax=ax2, linewidths=0.5)
-                ax2.set_title('CNN Confusion Matrix', color='white', pad=10)
-                ax2.set_xlabel('Predicted', color='#cdd6f4')
-                ax2.set_ylabel('True', color='#cdd6f4')
-                ax2.tick_params(colors='#cdd6f4')
-                fig2.patch.set_facecolor('#1e1e2e')
-                st.pyplot(fig2);  plt.close(fig2)
+                            xticklabels=['Normal','Attack'],
+                            yticklabels=['Normal','Attack'], ax=ax2)
+                ax2.set_title("CNN Confusion Matrix", color='white')
+                ax2.set_ylabel("True Label",      color='white')
+                ax2.set_xlabel("Predicted Label", color='white')
+                ax2.tick_params(colors='white')
+                fig2.tight_layout()
+                st.image(fig_to_pil(fig2))
  
-            with col_rep:
-                st.markdown("#### 📋 CNN Metrics")
-                st.metric("Accuracy",  f"{acc*100:.2f}%")
-                st.metric("F1-Score",  f"{f1:.4f}")
-                st.metric("Val Samples", len(yi_val))
-                with st.expander("Full Report"):
-                    report = classification_report(
-                        yi_val, y_pred, target_names=['Normal','Attack'])
-                    st.code(report)
+                st.text("Classification Report:")
+                report = classification_report(y_val.astype(int), y_pred,
+                                               target_names=['Normal','Attack'])
+                st.code(report)
  
-            # ── Predict on single live sample ─────────────────────────────────
-            st.markdown("---")
-            st.markdown("### Step 5 — Real-time CNN Prediction")
-            st.info("Generate a sample and let the CNN classify its image.")
+            except ImportError:
+                st.error("TensorFlow is not installed. Run: pip install tensorflow")
+            except Exception as e:
+                st.error(f"CNN training error: {e}")
  
-            col_x, col_y = st.columns(2)
-            with col_x:
-                sample_type = st.selectbox("Sample type", ["Random from dataset", "Simulated Normal", "Simulated Attack"])
-            with col_y:
-                pass  # spacer
+    st.markdown("---")
  
-            if st.button("🎯 Predict with CNN", type="primary", use_container_width=True):
-                if sample_type == "Random from dataset":
-                    idx = np.random.randint(len(X_raw))
-                    vec = X_raw[idx]
-                    true_lbl = y_raw[idx]
-                elif sample_type == "Simulated Normal":
-                    rng = np.random.RandomState()
-                    vec = rng.normal(0.1, 0.05, 41).clip(0, 1)
-                    true_lbl = 0
-                else:
-                    rng = np.random.RandomState()
-                    vec = rng.normal(0.7, 0.2, 41).clip(0, 1)
-                    vec[4]  = min(vec[4] * 10, 1.0)
-                    vec[24] = 0.95
-                    true_lbl = 1
+    # ── Step 5: Real-time CNN predict ─────────
+    st.subheader("Step 5 — Real-Time CNN Prediction")
  
-                img_2d   = traffic_to_image(vec)
-                img_4d   = img_2d[np.newaxis, ..., np.newaxis]
-                prob     = cnn_mdl.predict(img_4d, verbose=0)[0][0]
-                pred_lbl = int(prob >= 0.5)
+    sample_type = st.selectbox("Pick sample type", ["Normal", "Attack", "Random"])
+    if st.button("🎯 Predict with CNN"):
+        cnn_model = st.session_state.get('cnn_model')
+        df_cnn    = st.session_state.get('cnn_df')
+        if cnn_model is None:
+            st.warning("⚠️ Train the CNN first (Step 3).")
+        elif df_cnn is None:
+            st.warning("⚠️ Load data first (Step 1).")
+        else:
+            label_map = {"Normal": 0, "Attack": 1, "Random": np.random.randint(0,2)}
+            lv = label_map[sample_type]
+            subset = df_cnn[df_cnn['binary_label'] == lv] if sample_type != "Random" else df_cnn
+            row = subset.sample(1).iloc[0]
+            X_row = preprocess_data(pd.DataFrame([row]))
+            img   = traffic_to_image(X_row[0])
+            img_t = img[np.newaxis, ..., np.newaxis]
+            prob  = float(cnn_model.predict(img_t, verbose=0)[0][0])
+            pred  = 1 if prob > 0.5 else 0
  
-                fig3 = render_traffic_image(
-                    img_2d,
-                    title=f"CNN says: {'🚨 ATTACK' if pred_lbl==1 else '✅ NORMAL'}  "
-                          f"(confidence {prob if pred_lbl==1 else 1-prob:.2%})"
-                )
-                st.pyplot(fig3);  plt.close(fig3)
+            if pred == 1:
+                st.markdown('<span class="attack-badge">🚨 CNN says: ATTACK</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="normal-badge">✅ CNN says: NORMAL</span>', unsafe_allow_html=True)
+            st.metric("Attack Probability", f"{prob:.2%}")
  
-                if pred_lbl == 1:
-                    st.markdown('<div class="attack-badge">🚨 CNN PREDICTS: ATTACK</div>',
-                                unsafe_allow_html=True)
-                else:
-                    st.markdown('<div class="normal-badge">✅ CNN PREDICTS: NORMAL</div>',
-                                unsafe_allow_html=True)
+            fig, ax = plt.subplots(figsize=(4, 3))
+            fig.patch.set_facecolor('#0e1117')
+            cmap = 'Reds' if pred == 1 else 'Greens'
+            ax.imshow(img, cmap=cmap, interpolation='nearest', aspect='auto')
+            ax.set_title(f"Predicted: {'ATTACK' if pred==1 else 'NORMAL'}", color='white')
+            ax.tick_params(colors='white')
+            for sp in ax.spines.values():
+                sp.set_edgecolor('white')
+            fig.tight_layout()
+            st.image(fig_to_pil(fig))
  
-                st.metric("Attack Probability", f"{prob*100:.2f}%")
-                if 'X_raw' in st.session_state and sample_type == "Random from dataset":
-                    st.caption(f"True label: {'Attack' if true_lbl==1 else 'Normal'} | "
-                               f"CNN: {'Attack' if pred_lbl==1 else 'Normal'} | "
-                               f"{'✅ Correct' if pred_lbl==true_lbl else '❌ Wrong'}")
  
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 3 — Model Info
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# TAB 3 — MODEL INFO
+# ══════════════════════════════════════════════
 with tab3:
-    st.subheader("📊 Model Information & Architecture")
+    st.header("📊 Model Information")
  
-    col1, col2 = st.columns(2)
+    st.subheader("Architecture Comparison")
+    comp = pd.DataFrame({
+        "Property":    ["Type","Input","Output","Balancing","Best Recall"],
+        "Random Forest (ML)": ["Ensemble","41 features","Binary","SMOTE","~98.88% (CV)"],
+        "CNN (Image)":        ["Deep Learning","6×7 pixel image","Binary","Class weights","~session dependent"],
+    })
+    st.dataframe(comp.set_index("Property"), use_container_width=True)
  
-    with col1:
-        st.markdown("#### 🌲 Random Forest (ML Model)")
-        st.markdown("""
-        | Parameter | Value |
-        |-----------|-------|
-        | Algorithm | Random Forest |
-        | Trees | 300 |
-        | Max Depth | 20 |
-        | Dataset | NSL-KDD |
-        | SMOTE | Yes |
-        | Accuracy | **98.1%** |
-        | Recall | **98.67%** |
-        """)
- 
-    with col2:
-        st.markdown("#### 🧠 CNN (Image Model)")
-        st.markdown("""
-        | Layer | Details |
-        |-------|---------|
-        | Input | 6 × 7 × 1 grayscale |
-        | Conv2D | 32 filters, 2×2 |
-        | BatchNorm + MaxPool | — |
-        | Conv2D | 64 filters, 2×2 |
-        | BatchNorm | — |
-        | Dense | 64 units, ReLU |
-        | Dropout | 0.3 |
-        | Output | Sigmoid |
-        """)
- 
-    st.markdown("---")
-    st.markdown("#### 🔄 How Traffic → Image Works")
+    st.subheader("Traffic → Image Conversion")
     st.markdown("""
     ```
-    41 Network Features
-          ↓
+    Network Row (41 features)
+           ↓
     Min-Max Normalise → [0, 1]
-          ↓
-    Reshape to 6 × 7 grid (42 cells, last cell padded)
-          ↓
-    Grayscale Image (pixel = feature intensity)
-          ↓
-    CNN processes spatial patterns
-          ↓
-    Normal / Attack prediction
+           ↓
+    Reshape to 6 × 7 pixel grid
+           ↓
+    CNN: Conv2D → MaxPool → Conv2D → Dense → Sigmoid
+           ↓
+    Normal / Attack
     ```
     """)
  
-    st.markdown("---")
-    st.markdown("#### ℹ️ About the System")
-    st.markdown("""
-    This **Intrusion Detection System** combines two complementary approaches:
- 
-    - **Random Forest (Tab 1)**: Fast, tabular ML — industry-proven, high recall.
-    - **CNN Image Processing (Tab 2)**: Converts traffic to images, learns visual attack patterns.
- 
-    Dataset: **NSL-KDD** — the benchmark dataset for network intrusion detection.
+    st.subheader("CNN Architecture Detail")
+    st.code("""
+Input:  (6, 7, 1) — grayscale image
+Conv2D(32 filters, 2×2, relu, same padding)
+BatchNormalization
+MaxPooling2D(2×2, same padding)
+Conv2D(64 filters, 2×2, relu, same padding)
+BatchNormalization
+Flatten
+Dense(64, relu)
+Dropout(0.3)
+Dense(1, sigmoid)  →  Normal / Attack
     """)
  
-# ── Sidebar ────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.image("https://img.icons8.com/color/96/000000/security-checked.png", width=80)
-    st.markdown("## IDS Dashboard")
-    st.markdown("""
-    **Two Detection Engines:**
-    - 🌲 Random Forest (ML)
-    - 🧠 CNN (Image-based)
- 
-    ---
-    **Dataset:** NSL-KDD
-    **Features:** 41 network features
- 
-    ---
-    **Performance (RF):**
-    - Accuracy: 98.1%
-    - Recall: 98.67%
- 
-    ---
-    **CNN Image Size:** 6 × 7 pixels
-    """)
-    st.markdown("---")
-    st.caption("Built with Streamlit + TensorFlow")
+    st.subheader("About")
+    st.info(
+        "**Dataset:** NSL-KDD — benchmark for network intrusion detection research.\n\n"
+        "**ML Model:** Random Forest (300 trees, max depth 20) + SMOTE balancing.\n\n"
+        "**CNN Model:** Trained in-browser on 6×7 pixel representations of network traffic."
+    )
